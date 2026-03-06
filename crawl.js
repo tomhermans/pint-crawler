@@ -38,14 +38,171 @@ const STEALTH_ARGS = [
   '--lang=en-US,en',
 ];
 
-/**
- * Derives a manifest filename from the board URL.
- * https://pinterest.com/tom_meke/ideas/ → manifest-ideas.json
- */
+const RESOLUTION_PREFERENCE = ['originals', '1200x', '736x', '600x', '474x', '236x'];
+
+const resolveImageUrl = (pin) => {
+  const images = pin?.images ?? {};
+  for (const key of RESOLUTION_PREFERENCE) {
+    if (images[key]?.url) return images[key].url;
+  }
+  return null;
+};
+
 const manifestNameFromUrl = (url) => {
   const parts = new URL(url).pathname.replace(/\/$/, '').split('/').filter(Boolean);
   const boardSlug = parts[parts.length - 1] ?? 'board';
   return `manifest-${boardSlug}.json`;
+};
+
+const pinFromRaw = (p) => ({
+  pin_id: String(p.id),
+  image_url: resolveImageUrl(p),
+  title: p.title ?? '',
+  description: p.description ?? '',
+  source_url: p.link ?? '',
+  dominant_color: p.dominant_color ?? '',
+  section: p.board_section?.title ?? null,
+  created_at: p.created_at ?? null,
+});
+
+/**
+ * Extracts pins AND board metadata from the inline bootstrap JSON.
+ * Returns { pins, boardId, boardUrl, nextBookmark }
+ */
+const extractBootstrap = async (page) => {
+  try {
+    return await page.evaluate(() => {
+      const scripts = Array.from(document.querySelectorAll('script'));
+      for (const script of scripts) {
+        const text = script.textContent ?? '';
+        if (!text.includes('BoardFeedResource')) continue;
+
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch (_) {
+          continue;
+        }
+
+        const boardFeed =
+          json?.initialReduxState?.resources?.BoardFeedResource ??
+          json?.initialReduxState?.BoardFeedResource ??
+          json?.resources?.BoardFeedResource ??
+          null;
+
+        if (!boardFeed) continue;
+
+        for (const entry of Object.values(boardFeed)) {
+          const data = Array.isArray(entry?.data) ? entry.data
+            : Array.isArray(entry?.data?.data) ? entry.data.data
+            : null;
+
+          if (!data || data.length === 0) continue;
+
+          // Grab board metadata from first pin
+          const firstPin = data.find((p) => p?.board);
+          const boardId = firstPin?.board?.id ?? null;
+          const boardUrl = firstPin?.board?.url ?? null;
+          const nextBookmark = entry?.nextBookmark ?? null;
+
+          const pins = data
+            .filter((p) => p?.id && p?.type === 'pin')
+            .map((p) => {
+              const images = p.images ?? {};
+              const res = ['originals', '1200x', '736x', '600x', '474x', '236x'];
+              let image_url = null;
+              for (const r of res) {
+                if (images[r]?.url) { image_url = images[r].url; break; }
+              }
+              return {
+                pin_id: String(p.id),
+                image_url,
+                title: p.title ?? '',
+                description: p.description ?? '',
+                source_url: p.link ?? '',
+                dominant_color: p.dominant_color ?? '',
+                section: p.board_section?.title ?? null,
+                created_at: p.created_at ?? null,
+              };
+            })
+            .filter((p) => p.image_url);
+
+          return { pins, boardId, boardUrl, nextBookmark };
+        }
+      }
+      return { pins: [], boardId: null, boardUrl: null, nextBookmark: null };
+    });
+  } catch (_) {
+    return { pins: [], boardId: null, boardUrl: null, nextBookmark: null };
+  }
+};
+
+/**
+ * Fetches remaining pin pages directly via Pinterest's API using
+ * the board ID and cursor bookmark from the bootstrap data.
+ * This catches any pins that scroll-based XHR interception misses.
+ */
+const fetchRemainingPages = async (page, boardId, boardUrl, bookmark, onPinBatch) => {
+  if (!boardId || !bookmark || bookmark === '-end-') return;
+
+  let cursor = bookmark;
+  let page_num = 0;
+
+  while (cursor && cursor !== '-end-') {
+    page_num++;
+    const params = new URLSearchParams({
+      source_url: boardUrl,
+      data: JSON.stringify({
+        options: {
+          board_id: boardId,
+          board_url: boardUrl,
+          currentFilter: -1,
+          field_set_key: 'react_grid_pin',
+          filter_section_pins: true,
+          sort: 'default',
+          layout: 'default',
+          page_size: 25,
+          redux_normalize_feed: true,
+          bookmarks: [cursor],
+        },
+        context: {},
+      }),
+    });
+
+    const apiUrl = `https://www.pinterest.com/resource/BoardFeedResource/get/?${params}`;
+
+    try {
+      const json = await page.evaluate(async (url) => {
+        const res = await fetch(url, {
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          credentials: 'include',
+        });
+        return res.json();
+      }, apiUrl);
+
+      const data = json?.resource_response?.data;
+      if (!Array.isArray(data) || data.length === 0) break;
+
+      const pins = data
+        .filter((p) => p?.id && p?.type === 'pin')
+        .map(pinFromRaw)
+        .filter((p) => p.image_url);
+
+      if (pins.length > 0) {
+        log(`  API page ${page_num}: +${pins.length} pins`);
+        onPinBatch(pins);
+      }
+
+      cursor = json?.resource_response?.bookmark ?? null;
+      if (!cursor || cursor === '-end-') break;
+
+      // Polite delay between API calls
+      await page.waitForTimeout(800 + Math.random() * 400);
+    } catch (err) {
+      log(`  API page ${page_num}: fetch failed — ${err.message}`);
+      break;
+    }
+  }
 };
 
 async function main() {
@@ -77,14 +234,9 @@ async function main() {
       : 'Starting fresh crawl'
   );
 
-  // Shared stop signal — set by interceptor when Pinterest signals end of board,
-  // checked by scroller so it stops instead of running forever
   const stopSignal = { done: false };
 
-  const browser = await chromium.launch({
-    headless,
-    args: STEALTH_ARGS,
-  });
+  const browser = await chromium.launch({ headless, args: STEALTH_ARGS });
 
   const context = await browser.newContext({
     userAgent:
@@ -129,11 +281,30 @@ async function main() {
   await interceptPins(page, onPinBatch, stopSignal);
 
   log(`\nNavigating to ${args.url}`);
-  await page.goto(args.url, { waitUntil: 'networkidle', timeout: 30_000 });
+  await page.goto(args.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
   const boardName = await page.title().then((t) => t.replace(' | Pinterest', '').trim());
   log(`Board name : "${boardName}"\n`);
 
+  // Extract pins and cursor from the inline bootstrap blob
+  const { pins: bootstrapPins, boardId, boardUrl, nextBookmark } = await extractBootstrap(page);
+
+  if (bootstrapPins.length > 0) {
+    log(`  Bootstrap: found ${bootstrapPins.length} pins (bookmark: ${nextBookmark === '-end-' ? '-end-' : 'has more'})`);
+    onPinBatch(bootstrapPins);
+  } else {
+    log(`  Bootstrap: no pins found in page HTML`);
+  }
+
+  // If bootstrap has a non-end bookmark, fetch remaining pages via API directly.
+  // This is more reliable than scroll-based XHR interception for small/medium boards.
+  if (nextBookmark && nextBookmark !== '-end-') {
+    log(`  Fetching remaining pages via API...`);
+    await fetchRemainingPages(page, boardId, boardUrl, nextBookmark, onPinBatch);
+  }
+
+  // Also scroll to catch any pins the API approach might miss (large boards, sections, etc.)
+  await page.waitForTimeout(500);
   await scrollBoard(page, stopSignal);
 
   await page.waitForTimeout(2000);
