@@ -1,0 +1,6 @@
+node_modules/
+.env
+cookies.json
+manifest*.json
+downloads/
+*.partial

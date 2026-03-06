@@ -1,0 +1,19 @@
+{
+  "name": "pinterest-crawler",
+  "version": "1.0.0",
+  "description": "Crawls a Pinterest board and produces a manifest of all pins with image URLs",
+  "type": "module",
+  "main": "crawl.js",
+  "scripts": {
+    "crawl": "node crawl.js"
+  },
+  "dependencies": {
+    "playwright": "^1.41.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-s3": "^3.525.0",
+    "dotenv": "^16.4.5"
+  }
+}
